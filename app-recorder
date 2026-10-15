@@ -75,6 +75,7 @@ FPS_GIVEN=0
 TOGGLE=0
 STOP_MODE=0
 NOTIFY=1
+DEBUG=0                   # 1 = explain what the tool is doing and rejecting
 
 PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/app-recorder.$(id -u).pid"
 LOGFILE="${XDG_RUNTIME_DIR:-/tmp}/app-recorder.$(id -u).log"
@@ -94,6 +95,8 @@ declare -a SEG_SIZES=()
 # ------------------------------------------------------------------ output ---
 log() { printf '[app-recorder] %s\n' "$*" >&2; }
 warn() { printf '[app-recorder] WARNING: %s\n' "$*" >&2; }
+# --debug: explain what the tool is looking at and why it rejects a window
+debug() { [ "$DEBUG" -eq 1 ] && printf '[app-recorder]   %s\n' "$*" >&2; return 0; }
 die() {
 	printf '[app-recorder] ERROR: %s\n' "$*" >&2
 	exit 1
@@ -137,6 +140,7 @@ Options:
       --keep-parts       keep the intermediate .parts directory
       --stop             stop a running detached recording, if any
       --no-notify        do not send desktop notifications
+      --debug            log what the tool sees: windows it rejects and why
       --list             show what would be recorded (window, display, pid, audio
                          source), then exit without recording
   -h, --help             this help
@@ -225,6 +229,10 @@ while [ $# -gt 0 ]; do
 		;;
 	--no-notify)
 		NOTIFY=0
+		shift
+		;;
+	--debug)
+		DEBUG=1
 		shift
 		;;
 	--notify)
@@ -339,6 +347,13 @@ xauth_candidates() {
 	[ -n "${HOME:-}" ] && printf '%s\n' "${HOME}/.Xauthority"
 	local f
 	for f in /home/*/.Xauthority; do [ -e "$f" ] && printf '%s\n' "$f"; done
+	# Finally "-", which means "try the display without an XAUTHORITY override":
+	# on a display that needs no auth (Xvfb, or a session whose cookie lives
+	# elsewhere) that is the only way in, and without it a machine with no
+	# readable ~/.Xauthority probes no display at all, which looks exactly like
+	# "no focused window". It is a sentinel rather than an empty line because
+	# "$(...)" strips trailing newlines and would drop an empty candidate.
+	printf '%s\n' "-"
 }
 
 display_list() {
@@ -403,17 +418,31 @@ window_info() {
 # DIALOG; a window that declares no type at all counts as a normal window.
 window_ok() {
 	local wid="$1" info type
-	info=$(xwininfo -id "$wid" 2>/dev/null) || return 1
-	printf '%s' "$info" | grep -q 'Map State: IsViewable' || return 1
-	printf '%s' "$info" | grep -q 'Override Redirect State: yes' && return 1
-	printf '%s' "$info" | grep -q 'Map State: IsUnMapped' && return 1
+	info=$(xwininfo -id "$wid" 2>/dev/null) || {
+		debug "window $wid: xwininfo cannot read it"
+		return 1
+	}
+	printf '%s' "$info" | grep -q 'Map State: IsViewable' || {
+		debug "window $wid: $(printf '%s\n' "$info" | awk -F: '/Map State/{gsub(/^ +/,"",$2); print $2}')"
+		return 1
+	}
+	printf '%s' "$info" | grep -q 'Override Redirect State: yes' && {
+		debug "window $wid: override-redirect (a popup/launcher, not an application window)"
+		return 1
+	}
 	local w h
 	w=$(printf '%s\n' "$info" | awk -F: '/^  Width/{gsub(/ /,"",$2); print $2}')
 	h=$(printf '%s\n' "$info" | awk -F: '/^  Height/{gsub(/ /,"",$2); print $2}')
-	[ -n "$w" ] && [ -n "$h" ] && [ "$w" -ge 64 ] && [ "$h" -ge 64 ] || return 1
+	if [ -z "$w" ] || [ -z "$h" ] || [ "$w" -lt 64 ] || [ "$h" -lt 64 ]; then
+		debug "window $wid: too small (${w:-?}x${h:-?}, need 64x64)"
+		return 1
+	fi
 	type=$(xprop -id "$wid" _NET_WM_WINDOW_TYPE 2>/dev/null || true)
 	case "$type" in
-	*DOCK* | *DESKTOP* | *TOOLTIP* | *NOTIFICATION* | *SPLASH* | *MENU* | *DROPDOWN*) return 1 ;;
+	*DOCK* | *DESKTOP* | *TOOLTIP* | *NOTIFICATION* | *SPLASH* | *MENU* | *DROPDOWN*)
+		debug "window $wid: window type is not an application window: $type"
+		return 1
+		;;
 	esac
 	return 0
 }
@@ -457,13 +486,17 @@ find_active_window() {
 	while IFS= read -r disp; do
 		[ -n "$disp" ] || continue
 		while IFS= read -r xa; do
+			[ "$xa" = "-" ] && xa="" # sentinel: no XAUTHORITY override
 			[ -n "$xa" ] && [ ! -r "$xa" ] && continue
 			if [ -n "$xa" ]; then
 				wid=$(DISPLAY="$disp" XAUTHORITY="$xa" active_window_id)
 			else
 				wid=$(DISPLAY="$disp" active_window_id)
 			fi
-			[ -n "$wid" ] || continue
+			if [ -z "$wid" ]; then
+				debug "display $disp (xauth ${xa:-none}): no usable focused window"
+				continue
+			fi
 			if [ -n "$xa" ]; then
 				DISPLAY="$disp" XAUTHORITY="$xa" window_info "$wid" || continue
 				geom_of "$wid" "$disp" "$xa" || continue
@@ -503,6 +536,7 @@ find_window() {
 		lines=""
 		best_xa=""
 		while IFS= read -r xa; do
+			[ "$xa" = "-" ] && xa="" # sentinel: no XAUTHORITY override
 			[ -n "$xa" ] && [ ! -r "$xa" ] && continue
 			lines=$(wmctrl_for "$disp" "$xa")
 			if [ -n "$lines" ]; then

@@ -19,7 +19,7 @@ jobs:
       - name: Check formatting (shfmt)
         run: |
           go install mvdan.cc/sh/v3/cmd/shfmt@latest
-          shfmt -d app-recorder
+          "$(go env GOPATH)/bin/shfmt" -d app-recorder
 
   test:
     runs-on: ubuntu-latest

@@ -272,6 +272,9 @@ if [ "$FAIL" -gt "$FAIL_BEFORE_E2E" ]; then
 	printf -- '--- _NET_ACTIVE_WINDOW and window list on %s\n' "${DISP:-?}"
 	DISPLAY="${DISP:-:97}" xprop -root _NET_ACTIVE_WINDOW 2>&1 | head -2
 	DISPLAY="${DISP:-:97}" wmctrl -l 2>&1 | head -5
+	printf -- '--- what the tool sees (--list --debug)\n'
+	DISPLAY="${DISP:-:97}" XDG_RUNTIME_DIR="$TMP/run" "$SCRIPT" --display "${DISP:-:97}" \
+		--no-audio --debug --wait 3 --list 2>&1 | head -20
 fi
 
 # ----------------------------------------------------------------- audio (opt-in)
