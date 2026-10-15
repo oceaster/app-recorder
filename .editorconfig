@@ -1,0 +1,15 @@
+# Keep shell formatting identical everywhere: shfmt reads this file, and without
+# it the formatting it expects depends on whatever .editorconfig happens to sit
+# above the checkout (CI has none, a developer's home may have one).
+root = true
+
+[*]
+end_of_line = lf
+insert_final_newline = true
+charset = utf-8
+
+[app-recorder]
+indent_style = tab
+
+[*.sh]
+indent_style = tab

@@ -75,7 +75,7 @@ FPS_GIVEN=0
 TOGGLE=0
 STOP_MODE=0
 NOTIFY=1
-DEBUG=0                   # 1 = explain what the tool is doing and rejecting
+DEBUG=0 # 1 = explain what the tool is doing and rejecting
 
 PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/app-recorder.$(id -u).pid"
 LOGFILE="${XDG_RUNTIME_DIR:-/tmp}/app-recorder.$(id -u).log"
@@ -96,7 +96,10 @@ declare -a SEG_SIZES=()
 log() { printf '[app-recorder] %s\n' "$*" >&2; }
 warn() { printf '[app-recorder] WARNING: %s\n' "$*" >&2; }
 # --debug: explain what the tool is looking at and why it rejects a window
-debug() { [ "$DEBUG" -eq 1 ] && printf '[app-recorder]   %s\n' "$*" >&2; return 0; }
+debug() {
+	[ "$DEBUG" -eq 1 ] && printf '[app-recorder]   %s\n' "$*" >&2
+	return 0
+}
 die() {
 	printf '[app-recorder] ERROR: %s\n' "$*" >&2
 	exit 1
