@@ -26,12 +26,14 @@ PASS=0
 FAIL=0
 SKIP=0
 
-# shellcheck disable=SC2329  # invoked indirectly through the EXIT trap
+# shellcheck disable=SC2317,SC2329  # invoked indirectly through the EXIT trap
 cleanup() {
 	for pid in ${APP_PIDS[@]+"${APP_PIDS[@]}"}; do kill -TERM "$pid" 2>/dev/null; done
 	[ -n "$WM_PID" ] && kill -TERM "$WM_PID" 2>/dev/null
 	[ -n "$XVFB_PID" ] && kill -TERM "$XVFB_PID" 2>/dev/null
-	case "$TMP" in /tmp/*) rm -rf "$TMP" ;; esac
+	# give the killed processes a moment so removing their data dirs cannot race
+	sleep 1
+	case "$TMP" in /tmp/*) rm -rf "$TMP" 2>/dev/null || true ;; esac
 }
 trap cleanup EXIT
 
@@ -137,6 +139,7 @@ else
 fi
 
 # ------------------------------------------------------------- real recording
+FAIL_BEFORE_E2E=$FAIL
 section "recording on a throwaway display"
 
 need=(Xvfb ffmpeg ffprobe xwininfo xprop wmctrl)
@@ -179,7 +182,7 @@ else
 	if [ -z "$win" ]; then
 		skip "real recording (no window appeared on $DISP)"
 	else
-		DISPLAY="$DISP" XDG_RUNTIME_DIR="$TMP/run" "$SCRIPT" --display "$DISP" --no-audio \
+		DISPLAY="$DISP" XDG_RUNTIME_DIR="$TMP/run" "$SCRIPT" --display "$DISP" --no-audio --wait 10 \
 			-o "$TMP/out.mp4" --fps 10 --no-notify >"$TMP/rec.log" 2>&1 &
 		REC=$!
 		sleep 6
@@ -233,7 +236,7 @@ else
 		if [ -z "$second" ]; then
 			skip "switching focus retargets the recording (second window never appeared)"
 		else
-			DISPLAY="$DISP" XDG_RUNTIME_DIR="$TMP/run" "$SCRIPT" --display "$DISP" --no-audio \
+			DISPLAY="$DISP" XDG_RUNTIME_DIR="$TMP/run" "$SCRIPT" --display "$DISP" --no-audio --wait 10 \
 				-o "$TMP/follow.mp4" --fps 10 --no-notify >"$TMP/follow.log" 2>&1 &
 			REC2=$!
 			sleep 4
@@ -255,6 +258,20 @@ else
 			fi
 		fi
 	fi
+fi
+
+# When the end-to-end part fails, print what the environment did: without this a
+# CI failure is just "failed" with no way to tell why.
+if [ "$FAIL" -gt "$FAIL_BEFORE_E2E" ]; then
+	printf '\n── diagnostics (end-to-end failure)\n'
+	for f in xvfb.log wm.log app-A.log app-B.log rec.log follow.log; do
+		[ -s "$TMP/$f" ] || continue
+		printf -- '--- %s\n' "$f"
+		tail -12 "$TMP/$f"
+	done
+	printf -- '--- _NET_ACTIVE_WINDOW and window list on %s\n' "${DISP:-?}"
+	DISPLAY="${DISP:-:97}" xprop -root _NET_ACTIVE_WINDOW 2>&1 | head -2
+	DISPLAY="${DISP:-:97}" wmctrl -l 2>&1 | head -5
 fi
 
 # ----------------------------------------------------------------- audio (opt-in)

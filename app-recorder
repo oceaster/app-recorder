@@ -250,6 +250,12 @@ done
 case "$FPS" in '' | *[!0-9]*) die "--fps needs a number" ;; esac
 [ "$FPS" -ge 1 ] || die "--fps must be >= 1"
 case "$AUDIO_MODE" in app | sink) ;; *) die "--audio-mode must be 'app' or 'sink'" ;; esac
+# Validate the output name here, not after the window has been found: a typo in
+# -o should fail immediately rather than after waiting for a window.
+case "$OUT" in
+"" | *.mp4) ;;
+*) die "output file must end in .mp4 (got '$OUT')" ;;
+esac
 
 for tool in ffmpeg ffprobe wmctrl xwininfo python3; do
 	command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
@@ -413,12 +419,24 @@ window_ok() {
 }
 
 # The focused window on the display in the environment, or nothing.
+# WMs normally publish _NET_ACTIVE_WINDOW; xdotool is the next best answer, and
+# when neither exists (some minimal WMs) the top of the EWMH stacking list is a
+# reasonable stand-in for "the window in front".
 active_window_id() {
 	local wid
 	wid=$(xprop -root _NET_ACTIVE_WINDOW 2>/dev/null | sed -n 's/.*# *\(0x[0-9a-fA-F]\{1,\}\).*/\1/p' | head -n1)
-	if [ -z "$wid" ] && command -v xdotool >/dev/null 2>&1; then
-		wid=$(xdotool getactivewindow 2>/dev/null | head -n1)
-		[ -n "$wid" ] && wid=$(printf '0x%08x' "$wid")
+	if [ -z "$wid" ] || [ "$wid" = "0x0" ] || [ "$wid" = "0x00000000" ]; then
+		wid=""
+		if command -v xdotool >/dev/null 2>&1; then
+			local dec
+			dec=$(xdotool getactivewindow 2>/dev/null | head -n1)
+			[ -n "$dec" ] && wid=$(printf '0x%08x' "$dec")
+		fi
+	fi
+	if [ -z "$wid" ]; then
+		wid=$(xprop -root _NET_CLIENT_LIST_STACKING 2>/dev/null |
+			sed -n 's/.*# \(0x[0-9a-fA-F, x]*\).*/\1/p' |
+			tr ',' '\n' | awk 'NF { last = $1 } END { print last }')
 	fi
 	[ -n "$wid" ] || return 1
 	case "$wid" in 0x0 | 0x00000000 | 0x) return 1 ;; esac
@@ -1566,10 +1584,6 @@ fi
 if [ -z "$OUT" ]; then
 	OUT="${HOME:-/tmp}/Videos/recordings/Recording-$(date +%Y%m%d-%H%M%S).mp4"
 fi
-case "$OUT" in
-*.mp4) ;;
-*) die "output file must end in .mp4 (got '$OUT')" ;;
-esac
 mkdir -p "$(dirname "$OUT")" || die "cannot create $(dirname "$OUT")"
 OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"
 parts="${OUT%.*}.parts"
