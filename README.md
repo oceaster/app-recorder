@@ -46,7 +46,9 @@ that directory is a symlink to the newest recording.
 
 Run `app-recorder --help` for the full option list (`--fps`, `--quality`,
 `--encoder`, `--audio-mode`, `--allow-overlap`, `--wait`, `--no-pause`,
-`--no-mouse`, `--keep-parts`, `--display`, `--pid`, `--no-notify`).
+`--no-mouse`, `--keep-parts`, `--display`, `--pid`, `--no-notify`, `--debug`).
+`--debug` logs what the tool sees, including every window it rejects and the rule
+that rejected it — useful when the target is not the window you expected.
 
 ## What it does
 
