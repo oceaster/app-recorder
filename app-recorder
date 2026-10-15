@@ -1,0 +1,1783 @@
+#!/usr/bin/env bash
+#
+# app-recorder — record the ACTIVE application window (video + its own audio).
+#
+# Press the hotkey (Ctrl+Mod+R) and it records whichever window has focus, with
+# that application's own audio. Switch to another application mid-recording and
+# the target follows: the segment is closed and a new one starts on the newly
+# focused window (new geometry, and its audio instead). Press the hotkey again
+# to stop and save.
+#
+# Everything is discovered automatically:
+#   * the X display and XAUTHORITY that actually hold the focused window
+#     (each X server on this machine is tried in turn),
+#   * the window id, its position and size, and the pid behind it,
+#   * the PipeWire/PulseAudio instance that pid is playing into, and the app's
+#     own output stream inside it.
+#     (This box runs two PipeWire instances: a seat-wide one and a per-user one
+#     under /run/user/<uid>; the application's own environment decides which.)
+#
+# The capture is sandboxed to the recorded application:
+#   * video: only that window's rectangle is captured, and capture PAUSES
+#     whenever anything else is stacked over it — a notification popup, another
+#     application's window — so no other window ever appears in the video,
+#   * audio: by default only that application's own PipeWire stream is tapped, so
+#     audio from other applications on the same device is NOT recorded.
+#     `--audio-mode sink` records the whole device instead, and `--allow-overlap`
+#     records through covering windows.
+#
+# Examples:
+#   app-recorder                            # record the active window (hotkey path)
+#   app-recorder --toggle                   # start recording, or stop it if running
+#   app-recorder --no-follow                # stay on the window focused at start
+#   app-recorder --window-name minecraft    # pin to an app instead of following focus
+#   app-recorder -o ~/Videos/clip.mp4       # explicit output file
+#   app-recorder --list                     # diagnostics: window + audio source
+#   app-recorder --no-audio --fps 60
+#
+# --toggle is what the i3 hotkey (Ctrl+Mod+R) uses: the first press starts a
+# detached recording, the next press stops it and saves the file. The detached
+# process writes $XDG_RUNTIME_DIR/app-recorder.<uid>.pid and logs to
+# $XDG_RUNTIME_DIR/app-recorder.<uid>.log.
+#
+# Audio note: the application is captured by linking a capture stream to its own
+# output ports (PipeWire has no per-application monitor). That does not change
+# what is audible and adds no latency. An application with no audio stream yet is
+# recorded video-only until its stream appears.
+#
+# The recording is written as crash-tolerant Matroska segments and remuxed into
+# a single .mp4 when recording stops.
+
+set -uo pipefail
+
+VERSION="1.0.0"
+
+# --------------------------------------------------------------- defaults ---
+OUT=""
+FPS=30
+WINDOW_PATTERN="" # empty = record the focused window; a pattern pins to an app
+FOLLOW=1          # 1 = move to the newly focused window on an app switch
+ENCODER="auto"    # auto | h264_nvenc | libx264 | hevc_nvenc | ...
+QUALITY=23        # -cq (nvenc) or -crf (x264)
+AUDIO=1
+AUDIO_SOURCE=""
+AUDIO_MODE="app" # app = tap only the recorded application's stream; sink = whole device
+ALLOW_OVERLAP=0  # 1 = keep recording while another window covers the target
+WAIT_SECONDS=300 # how long to wait for a recordable window to appear
+POLL=1           # seconds between window checks
+PAUSE_HIDDEN=1   # pause while the window is not viewable
+DRAW_MOUSE=1
+FORCED_DISPLAY=""
+FORCED_PID=""
+LIST_ONLY=0
+KEEP_PARTS=0
+FPS_GIVEN=0
+TOGGLE=0
+STOP_MODE=0
+NOTIFY=1
+
+PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/app-recorder.$(id -u).pid"
+LOGFILE="${XDG_RUNTIME_DIR:-/tmp}/app-recorder.$(id -u).log"
+
+FFPID=""
+TAPPID=""
+TAPNODE=""
+TAPFIFO=""
+AUDIO_KIND=""
+AUDIO_TARGET=""
+SEG_ACTIVE=0
+STOP=0
+FINALIZED=0
+declare -a SEGS=()
+declare -a SEG_SIZES=()
+
+# ------------------------------------------------------------------ output ---
+log() { printf '[app-recorder] %s\n' "$*" >&2; }
+warn() { printf '[app-recorder] WARNING: %s\n' "$*" >&2; }
+die() {
+	printf '[app-recorder] ERROR: %s\n' "$*" >&2
+	exit 1
+}
+
+usage() {
+	sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'
+	cat <<'EOF'
+
+Options:
+  -o, --output FILE      output file (default ~/Videos/recordings/Recording-<date>.mp4)
+      --fps N            capture frame rate (default 30)
+      --quality N        x264 CRF / nvenc CQ, lower is better (default 23)
+      --encoder NAME     auto (default), libx264, h264_nvenc, hevc_nvenc, ...
+      --no-audio         record video only
+      --audio-source SRC record this PipeWire/Pulse source (a whole-device monitor)
+      --audio-mode MODE  app (default): tap only the recorded application's audio
+                         stream, so nothing else playing on the same device leaks
+                         in; sink: record the monitor of the device it plays to
+                         (includes every other app using that device)
+      --no-follow        keep recording the window that was focused at start
+                         instead of following focus changes
+      --window-name PAT  pin to a window whose WM_CLASS matches PAT (case
+                         insensitive) instead of recording the focused window;
+                         the recording then also stops when that window closes
+      --allow-overlap    keep recording while another window covers the target
+                         (by default capture pauses, so no other app's window or
+                         notification popup ever appears in the video)
+      --pid PID          treat PID as the target process (skip window->pid lookup)
+      --display D        force an X display, e.g. :1
+      --wait SECONDS     wait this long for a window to appear (default 300, 0 = no wait)
+      --no-pause         keep recording while the window is hidden/minimised
+      --no-mouse         do not draw the mouse cursor
+      --keep-parts       keep the intermediate .parts directory
+      --toggle           start a detached recording, or stop the one running
+                         (this is the i3 hotkey Ctrl+Mod+R)
+      --display D        force an X display, e.g. :1
+      --wait SECONDS     wait this long for a window to appear (default 300, 0 = no wait)
+      --no-pause         keep recording while the window is hidden/minimised
+      --no-mouse         do not draw the mouse cursor
+      --keep-parts       keep the intermediate .parts directory
+      --stop             stop a running detached recording, if any
+      --no-notify        do not send desktop notifications
+      --list             show what would be recorded (window, display, pid, audio
+                         source), then exit without recording
+  -h, --help             this help
+  -V, --version          version
+EOF
+}
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-o | --output)
+		OUT="${2:-}"
+		shift 2
+		;;
+	--fps)
+		FPS="${2:-}"
+		FPS_GIVEN=1
+		shift 2
+		;;
+	--quality)
+		QUALITY="${2:-}"
+		shift 2
+		;;
+	--encoder)
+		ENCODER="${2:-}"
+		shift 2
+		;;
+	--no-audio)
+		AUDIO=0
+		shift
+		;;
+	--audio-source)
+		AUDIO_SOURCE="${2:-}"
+		shift 2
+		;;
+	--audio-mode)
+		AUDIO_MODE="${2:-}"
+		shift 2
+		;;
+	--allow-overlap)
+		ALLOW_OVERLAP=1
+		shift
+		;;
+	--follow)
+		FOLLOW=1
+		shift
+		;;
+	--no-follow)
+		FOLLOW=0
+		shift
+		;;
+	--window-name)
+		WINDOW_PATTERN="${2:-}"
+		shift 2
+		;;
+	--pid)
+		FORCED_PID="${2:-}"
+		shift 2
+		;;
+	--display)
+		FORCED_DISPLAY="${2:-}"
+		shift 2
+		;;
+	--wait)
+		WAIT_SECONDS="${2:-}"
+		shift 2
+		;;
+	--no-pause)
+		PAUSE_HIDDEN=0
+		shift
+		;;
+	--no-mouse)
+		DRAW_MOUSE=0
+		shift
+		;;
+	--keep-parts)
+		KEEP_PARTS=1
+		shift
+		;;
+	--toggle)
+		TOGGLE=1
+		shift
+		;;
+	--stop)
+		STOP_MODE=1
+		shift
+		;;
+	--no-notify)
+		NOTIFY=0
+		shift
+		;;
+	--notify)
+		NOTIFY=1
+		shift
+		;;
+	--list)
+		LIST_ONLY=1
+		shift
+		;;
+	-h | --help)
+		usage
+		exit 0
+		;;
+	-V | --version)
+		echo "app-recorder $VERSION"
+		exit 0
+		;;
+	*) die "unknown option '$1' (try --help)" ;;
+	esac
+done
+
+case "$FPS" in '' | *[!0-9]*) die "--fps needs a number" ;; esac
+[ "$FPS" -ge 1 ] || die "--fps must be >= 1"
+case "$AUDIO_MODE" in app | sink) ;; *) die "--audio-mode must be 'app' or 'sink'" ;; esac
+
+for tool in ffmpeg ffprobe wmctrl xwininfo python3; do
+	command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
+done
+command -v pactl >/dev/null 2>&1 || [ "$AUDIO" -eq 0 ] || {
+	warn "pactl not found — falling back to --no-audio"
+	AUDIO=0
+}
+
+# ------------------------------------------------------------ small helpers ---
+# Read one variable out of another process's environment (needs read access).
+proc_env() {
+	local pid="$1" name="$2"
+	[ -r "/proc/$pid/environ" ] || return 1
+	tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | sed -n "s/^${name}=//p" | head -n1
+}
+
+pid_alive() { [ -n "${1:-}" ] && [ "$1" != "0" ] && kill -0 "$1" 2>/dev/null; }
+
+# Signals ignored by a process. A script (and its children) started in the
+# background by a non-interactive shell inherits SIGINT ignored, so a plain
+# `kill -INT` would do nothing and the recording could not be stopped.
+signal_ignored() {
+	local pid="$1" sig="$2" mask bit
+	mask=$(awk '/^SigIgn:/{print $2}' "/proc/$pid/status" 2>/dev/null)
+	[ -n "$mask" ] || return 1
+	bit=$(((0x$mask >> (sig - 1)) & 1))
+	[ "$bit" -eq 1 ]
+}
+
+# The signal that will actually stop a process: SIGINT if it listens, else
+# SIGTERM if it listens, else nothing (caller falls back to SIGKILL).
+stop_signal_for() {
+	local pid="$1"
+	signal_ignored "$pid" 2 || {
+		printf 'INT\n'
+		return 0
+	}
+	signal_ignored "$pid" 15 || {
+		printf 'TERM\n'
+		return 0
+	}
+	printf '\n'
+}
+
+# Desktop notification (only when a session bus / notify daemon is reachable).
+# A short timeout keeps the popup from lingering: the popup is a window above
+# the target, and capture waits for it to clear so it never lands in the video.
+notify() {
+	local summary="$1" body="$2" icon="${3:-camera-video}" ttl="${4:-2500}"
+	[ "$NOTIFY" -eq 1 ] || return 0
+	[ -n "${DISPLAY:-}" ] || return 0
+	command -v notify-send >/dev/null 2>&1 || return 0
+	notify-send -a app-recorder -i "$icon" -t "$ttl" "$summary" "$body" 2>/dev/null || true
+}
+
+# Pid of the detached recording started by --toggle, if it is still alive.
+running_pid() {
+	local p
+	[ -r "$PIDFILE" ] || return 1
+	p=$(cat "$PIDFILE" 2>/dev/null)
+	if [ -n "$p" ] && pid_alive "$p" && tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -qE 'app-recorder|win-record|mc-record'; then
+		printf '%s\n' "$p"
+		return 0
+	fi
+	rm -f "$PIDFILE"
+	return 1
+}
+
+release_pidfile() {
+	[ -r "$PIDFILE" ] || return 0
+	[ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$PIDFILE"
+	return 0
+}
+
+# XAUTHORITY files worth trying for a given display, in order of likelihood.
+xauth_candidates() {
+	local disp="$1"
+	[ -n "${XAUTHORITY:-}" ] && printf '%s\n' "$XAUTHORITY"
+	printf '%s\n' "/run/lightdm/root/${disp}"
+	[ -n "${HOME:-}" ] && printf '%s\n' "${HOME}/.Xauthority"
+	local f
+	for f in /home/*/.Xauthority; do [ -e "$f" ] && printf '%s\n' "$f"; done
+}
+
+display_list() {
+	if [ -n "$FORCED_DISPLAY" ]; then
+		printf '%s\n' "$FORCED_DISPLAY"
+		return
+	fi
+	[ -n "${DISPLAY:-}" ] && printf '%s\n' "$DISPLAY"
+	local sock
+	for sock in /tmp/.X11-unix/X*; do
+		[ -S "$sock" ] || continue
+		printf ':%s\n' "${sock##*X}"
+	done
+}
+
+# Print `wmctrl -lpx` for a display, or nothing if we cannot talk to it.
+wmctrl_for() {
+	local disp="$1" xa="$2" out
+	if [ -n "$xa" ]; then
+		out=$(DISPLAY="$disp" XAUTHORITY="$xa" wmctrl -lpx 2>/dev/null)
+	else
+		out=$(DISPLAY="$disp" wmctrl -lpx 2>/dev/null)
+	fi
+	printf '%s\n' "$out" | grep -E '^0x[0-9a-fA-F]+' || true
+}
+
+geom_of() {
+	# geom_of WINDOW_ID DISPLAY XAUTHORITY -> sets GX GY GW GH GMAP
+	local wid="$1" disp="$2" xa="${3:-}" info
+	if [ -n "$xa" ]; then
+		info=$(DISPLAY="$disp" XAUTHORITY="$xa" xwininfo -id "$wid" 2>/dev/null)
+	else
+		info=$(DISPLAY="$disp" xwininfo -id "$wid" 2>/dev/null)
+	fi
+	[ -n "$info" ] || return 1
+	GX=$(printf '%s\n' "$info" | awk -F: '/Absolute upper-left X/{gsub(/ /,"",$2); print $2}')
+	GY=$(printf '%s\n' "$info" | awk -F: '/Absolute upper-left Y/{gsub(/ /,"",$2); print $2}')
+	GW=$(printf '%s\n' "$info" | awk -F: '/^  Width/{gsub(/ /,"",$2); print $2}')
+	GH=$(printf '%s\n' "$info" | awk -F: '/^  Height/{gsub(/ /,"",$2); print $2}')
+	GMAP=$(printf '%s\n' "$info" | awk -F: '/Map State/{gsub(/ /,"",$2); print $2}')
+	[ -n "$GX" ] && [ -n "$GY" ] && [ -n "$GW" ] && [ -n "$GH" ]
+}
+
+# ------------------------------------------------------- window discovery ----
+# Metadata for one window id: sets WINFO_PID / WINFO_CLASS / WINFO_TITLE.
+window_info() {
+	local wid="$1" props
+	WINFO_PID=""
+	WINFO_CLASS=""
+	WINFO_TITLE=""
+	props=$(xprop -id "$wid" _NET_WM_PID WM_CLASS _NET_WM_NAME WM_NAME 2>/dev/null) || return 1
+	WINFO_PID=$(printf '%s\n' "$props" | sed -n 's/^_NET_WM_PID(CARDINAL) = //p' | head -n1)
+	WINFO_CLASS=$(printf '%s\n' "$props" | sed -n 's/^WM_CLASS(STRING) = .*"\([^"]*\)"/\1/p' | head -n1)
+	WINFO_TITLE=$(printf '%s\n' "$props" | sed -n 's/^_NET_WM_NAME(UTF8_STRING) = "\(.*\)"$/\1/p' | head -n1)
+	[ -n "$WINFO_TITLE" ] || WINFO_TITLE=$(printf '%s\n' "$props" | sed -n 's/^WM_NAME(STRING) = "\(.*\)"$/\1/p' | head -n1)
+	[ -n "$WINFO_CLASS" ] || [ -n "$WINFO_TITLE" ]
+}
+
+# Is this a window worth recording? Rejects the desktop's furniture: unmapped
+# windows, override-redirect popups (notification daemons, launchers), docks and
+# status bars, and tiny helper/clipboard slivers. app windows may be NORMAL or
+# DIALOG; a window that declares no type at all counts as a normal window.
+window_ok() {
+	local wid="$1" info type
+	info=$(xwininfo -id "$wid" 2>/dev/null) || return 1
+	printf '%s' "$info" | grep -q 'Map State: IsViewable' || return 1
+	printf '%s' "$info" | grep -q 'Override Redirect State: yes' && return 1
+	printf '%s' "$info" | grep -q 'Map State: IsUnMapped' && return 1
+	local w h
+	w=$(printf '%s\n' "$info" | awk -F: '/^  Width/{gsub(/ /,"",$2); print $2}')
+	h=$(printf '%s\n' "$info" | awk -F: '/^  Height/{gsub(/ /,"",$2); print $2}')
+	[ -n "$w" ] && [ -n "$h" ] && [ "$w" -ge 64 ] && [ "$h" -ge 64 ] || return 1
+	type=$(xprop -id "$wid" _NET_WM_WINDOW_TYPE 2>/dev/null || true)
+	case "$type" in
+	*DOCK* | *DESKTOP* | *TOOLTIP* | *NOTIFICATION* | *SPLASH* | *MENU* | *DROPDOWN*) return 1 ;;
+	esac
+	return 0
+}
+
+# The focused window on the display in the environment, or nothing.
+active_window_id() {
+	local wid
+	wid=$(xprop -root _NET_ACTIVE_WINDOW 2>/dev/null | sed -n 's/.*# *\(0x[0-9a-fA-F]\{1,\}\).*/\1/p' | head -n1)
+	if [ -z "$wid" ] && command -v xdotool >/dev/null 2>&1; then
+		wid=$(xdotool getactivewindow 2>/dev/null | head -n1)
+		[ -n "$wid" ] && wid=$(printf '0x%08x' "$wid")
+	fi
+	[ -n "$wid" ] || return 1
+	case "$wid" in 0x0 | 0x00000000 | 0x) return 1 ;; esac
+	window_ok "$wid" || return 1
+	printf '%s\n' "$wid"
+}
+
+# Focused window across the candidate displays; sets the WIN_* globals.
+# Returns 1 when nothing focusable is found on any of them.
+find_active_window() {
+	local disp xa wid
+	WIN_ID=""
+	WIN_DISPLAY=""
+	WIN_XAUTH=""
+	WIN_PID=""
+	WIN_CLASS=""
+	WIN_TITLE=""
+	while IFS= read -r disp; do
+		[ -n "$disp" ] || continue
+		while IFS= read -r xa; do
+			[ -n "$xa" ] && [ ! -r "$xa" ] && continue
+			if [ -n "$xa" ]; then
+				wid=$(DISPLAY="$disp" XAUTHORITY="$xa" active_window_id)
+			else
+				wid=$(DISPLAY="$disp" active_window_id)
+			fi
+			[ -n "$wid" ] || continue
+			if [ -n "$xa" ]; then
+				DISPLAY="$disp" XAUTHORITY="$xa" window_info "$wid" || continue
+				geom_of "$wid" "$disp" "$xa" || continue
+			else
+				DISPLAY="$disp" window_info "$wid" || continue
+				geom_of "$wid" "$disp" || continue
+			fi
+			WIN_ID="$wid"
+			WIN_DISPLAY="$disp"
+			WIN_XAUTH="$xa"
+			WIN_PID="$WINFO_PID"
+			WIN_CLASS="$WINFO_CLASS"
+			WIN_TITLE="$WINFO_TITLE"
+			return 0
+		done <<<"$(xauth_candidates "$disp")"
+	done <<<"$(display_list)"
+	return 1
+}
+
+# Sets: WIN_ID WIN_DISPLAY WIN_XAUTH WIN_PID WIN_CLASS WIN_TITLE
+find_window() {
+	local disp xa line wid pid cls title best_area=-1 area lines best_xa
+	WIN_ID=""
+	WIN_DISPLAY=""
+	WIN_XAUTH=""
+	WIN_PID=""
+	WIN_CLASS=""
+	WIN_TITLE=""
+	if [ -z "$WINDOW_PATTERN" ]; then
+		# No pattern: the target is whatever currently has focus.
+		find_active_window
+		return $?
+	fi
+	while IFS= read -r disp; do
+		[ -n "$disp" ] || continue
+		# The first XAUTHORITY that can talk to this display wins.
+		lines=""
+		best_xa=""
+		while IFS= read -r xa; do
+			[ -n "$xa" ] && [ ! -r "$xa" ] && continue
+			lines=$(wmctrl_for "$disp" "$xa")
+			if [ -n "$lines" ]; then
+				best_xa="$xa"
+				break
+			fi
+		done <<<"$(xauth_candidates "$disp")"
+		[ -n "$lines" ] || continue
+		while IFS= read -r line; do
+			[ -n "$line" ] || continue
+			wid=$(printf '%s' "$line" | awk '{print $1}')
+			pid=$(printf '%s' "$line" | awk '{print $3}')
+			cls=$(printf '%s' "$line" | awk '{print $4}')
+			title=$(printf '%s' "$line" | awk '{for (i = 1; i <= 4; i++) $i = ""; sub(/^[ \t]+/, ""); print}')
+			case "$(printf '%s' "$cls" | tr '[:upper:]' '[:lower:]')" in
+			*"$(printf '%s' "$WINDOW_PATTERN" | tr '[:upper:]' '[:lower:]')"*) ;;
+			*) continue ;;
+			esac
+			geom_of "$wid" "$disp" "$best_xa" || continue
+			area=$((GW * GH))
+			if [ "$area" -gt "$best_area" ]; then
+				best_area=$area
+				WIN_ID="$wid"
+				WIN_DISPLAY="$disp"
+				WIN_XAUTH="$best_xa"
+				WIN_PID="$pid"
+				WIN_CLASS="$cls"
+				WIN_TITLE="$title"
+			fi
+			if [ "$LIST_ONLY" -eq 1 ]; then
+				printf 'window %s  display %s  xauth %s  pid %s  %sx%s+%s+%s  map=%s\n    class: %s\n    title: %s\n' \
+					"$wid" "$disp" "${best_xa:-none}" "$pid" "$GW" "$GH" "$GX" "$GY" "$GMAP" "$cls" "$title"
+			fi
+		done <<<"$lines"
+	done <<<"$(display_list)"
+	[ -n "$WIN_ID" ]
+}
+
+# ----------------------------------------------------- target switching ----
+# Does the window still exist at all (mapped or not)?
+window_exists() {
+	[ -n "${1:-}" ] || return 1
+	xwininfo -id "$1" >/dev/null 2>&1
+}
+
+# Move the recording to another window: used when focus changes application and
+# when the recorded window closes. Ends the current segment so the new window is
+# captured at its own size, and re-points the audio tap at the new process.
+switch_target() {
+	local wid="$1" old_id="$WIN_ID" old_title="${WIN_TITLE:-${WIN_CLASS:-window}}"
+	window_ok "$wid" || {
+		warn "$wid is not a recordable window"
+		return 1
+	}
+	window_info "$wid" || {
+		warn "cannot read properties of $wid"
+		return 1
+	}
+	WIN_ID="$wid"
+	WIN_PID="$WINFO_PID"
+	WIN_CLASS="$WINFO_CLASS"
+	WIN_TITLE="$WINFO_TITLE"
+	[ -n "$FORCED_PID" ] && WIN_PID="$FORCED_PID"
+	log "target is now $WIN_ID '${WIN_TITLE:-}' (class ${WIN_CLASS:-unknown}, pid ${WIN_PID:-unknown}), was $old_id '$old_title'"
+	stop_segment
+	cur_geom=""
+	fail_count=0
+	paused_why=""
+	if [ "$AUDIO" -eq 1 ]; then
+		if resolve_audio_server "$WIN_PID"; then
+			resolve_audio_target "$WIN_PID" || {
+				AUDIO_KIND=""
+				AUDIO_TARGET=""
+				log "audio: the new target has no audio stream yet (video only for now)"
+			}
+		else
+			AUDIO_KIND=""
+			AUDIO_TARGET=""
+		fi
+	fi
+	notify "Window recording" "Now recording ${WIN_TITLE:-${WIN_CLASS:-window}}" "media-record" 2000
+	return 0
+}
+
+# ----------------------------------------------------- audio discovery -------
+# Derive the PulseAudio server address the recorded *application* is using, and
+# runtime dir that belongs to it. Falls back to the caller's environment.
+AUDIO_SERVER=""
+PW_RUNTIME=""
+resolve_audio_server() {
+	local pid="$1" xdg pw
+	AUDIO_SERVER=""
+	PW_RUNTIME=""
+	if pid_alive "$pid"; then
+		local psrv
+		psrv=$(proc_env "$pid" PULSE_SERVER || true)
+		if [ -n "$psrv" ]; then
+			AUDIO_SERVER="$psrv"
+		else
+			xdg=$(proc_env "$pid" XDG_RUNTIME_DIR || true)
+			if [ -n "$xdg" ] && [ -S "$xdg/pulse/native" ]; then
+				AUDIO_SERVER="unix:$xdg/pulse/native"
+			fi
+			if [ -z "$AUDIO_SERVER" ]; then
+				pw=$(proc_env "$pid" PIPEWIRE_RUNTIME_DIR || true)
+				if [ -n "$pw" ] && [ -S "$pw/pulse/native" ]; then
+					AUDIO_SERVER="unix:$pw/pulse/native"
+				fi
+			fi
+		fi
+	fi
+	if [ -z "$AUDIO_SERVER" ]; then
+		if [ -n "${PULSE_SERVER:-}" ]; then
+			AUDIO_SERVER="$PULSE_SERVER"
+		elif [ -S "/run/user/$(id -u)/pulse/native" ]; then
+			AUDIO_SERVER="unix:/run/user/$(id -u)/pulse/native"
+		elif [ -S /run/pipewire/pulse/native ]; then
+			AUDIO_SERVER="unix:/run/pipewire/pulse/native"
+		fi
+	fi
+	case "$AUDIO_SERVER" in
+	unix:*"/pulse/native")
+		PW_RUNTIME="${AUDIO_SERVER#unix:}"
+		PW_RUNTIME="${PW_RUNTIME%/pulse/native}"
+		;;
+	esac
+	[ -n "$AUDIO_SERVER" ]
+}
+
+# Does this source exist on the application's audio server?
+source_exists() {
+	local src="$1"
+	[ -n "$src" ] || return 1
+	pactl -s "$AUDIO_SERVER" list short sources 2>/dev/null | awk '{print $2}' | grep -Fxq "$src"
+}
+
+sink_inputs_for_pid_tree() {
+	# Print "<source-name>" candidates taken from pactl sink-inputs.
+	local pids="$1" block sink idx name
+	pactl -s "$AUDIO_SERVER" list sink-inputs 2>/dev/null | awk -v RS='Sink Input #' 'NR>1{print}' >"${TMPDIR:-/tmp}/.mcrec-si.$$" || return 1
+	while IFS= read -r block; do
+		[ -n "$block" ] || continue
+		if printf '%s' "$block" | grep -qiE 'application\.process\.id = "?('"$pids"')"?$' ||
+			printf '%s' "$block" | grep -qiE 'node\.name = "?(java|minecraft|Minecraft)' ||
+			printf '%s' "$block" | grep -qiE 'application\.name = "?(java|Minecraft)'; then
+			sink=$(printf '%s' "$block" | sed -n 's/^[[:space:]]*Sink: \([0-9]\{1,\}\).*/\1/p' | head -n1)
+			[ -n "$sink" ] || continue
+			name=$(pactl -s "$AUDIO_SERVER" list short sinks 2>/dev/null | awk -v i="$sink" '$1==i{print $2}')
+			[ -n "$name" ] && printf '%s.monitor\n' "$name"
+		fi
+	done <"${TMPDIR:-/tmp}/.mcrec-si.$$"
+	rm -f "${TMPDIR:-/tmp}/.mcrec-si.$$"
+}
+
+# Walk the PipeWire graph: application process -> its output stream -> the sink it
+# feeds. Prints "node <id>" for the stream itself (the per-application tap
+# target) and "monitor <source>" for the sink it plays to (fallback capture).
+pw_audio_info() {
+	local pid="$1" dir="$2"
+	# The JSON is passed as a file argument (process substitution) because stdin
+	# carries the program itself. pw-dump needs the runtime dir explicitly: a
+	# variable prefix on this command would not reach the process substitution.
+	PIPEWIRE_RUNTIME_DIR="$dir" XDG_RUNTIME_DIR="$dir" \
+		python3 - "$pid" <(PIPEWIRE_RUNTIME_DIR="$dir" XDG_RUNTIME_DIR="$dir" pw-dump 2>/dev/null) <<'PY'
+import json, os, sys
+
+root = int(sys.argv[1])
+try:
+    with open(sys.argv[2]) as fh:
+        data = json.load(fh)
+except Exception:
+    sys.exit(0)
+
+def tree(r):
+    pids, changed = {r}, True
+    while changed:
+        changed = False
+        for d in os.listdir('/proc'):
+            if not d.isdigit():
+                continue
+            p = int(d)
+            if p in pids:
+                continue
+            try:
+                with open('/proc/%d/stat' % p) as fh:
+                    st = fh.read()
+                ppid = int(st[st.rfind(')') + 2:].split()[1])
+            except Exception:
+                continue
+            if ppid in pids:
+                pids.add(p)
+                changed = True
+    return pids
+
+clients = {}
+nodes = {}
+links = []
+for item in data:
+    kind = item.get('type')
+    props = item.get('info', {}).get('props', {}) or {}
+    if kind == 'PipeWire:Interface:Client':
+        clients[item['id']] = props
+    elif kind == 'PipeWire:Interface:Node':
+        nodes[item['id']] = props
+    elif kind == 'PipeWire:Interface:Link':
+        links.append(props)
+
+wanted = {str(p) for p in tree(root)}
+streams = []
+for nid, props in nodes.items():
+    if not str(props.get('media.class', '')).startswith('Stream/Output'):
+        continue
+    cid = props.get('client.id')
+    cprops = clients.get(int(cid), {}) if cid is not None else {}
+    owners = {str(props.get('application.process.id')), str(cprops.get('application.process.id'))}
+    if owners & wanted:
+        streams.append(nid)
+
+def peer_down(node_id, seen):
+    """Follow links out of node_id until an Audio/Sink is found."""
+    if node_id in seen:
+        return None
+    seen.add(node_id)
+    for lk in links:
+        if lk.get('link.output.node') == node_id:
+            nxt = lk.get('link.input.node')
+            props = nodes.get(nxt, {})
+            if str(props.get('media.class')) == 'Audio/Sink':
+                return props.get('node.name')
+            found = peer_down(nxt, seen)
+            if found:
+                return found
+    return None
+
+for sid in streams:
+    props = nodes.get(sid, {})
+    monitor = None
+    target = props.get('node.target') or props.get('target.object')
+    if target:
+        for nid, nprops in nodes.items():
+            if nprops.get('node.name') == target and str(nprops.get('media.class')) == 'Audio/Sink':
+                monitor = '%s.monitor' % nprops.get('node.name')
+                break
+    if not monitor:
+        name = peer_down(sid, set())
+        if name:
+            monitor = '%s.monitor' % name
+    # The node id is what a per-application tap links to; the monitor is the
+    # whole-sink fallback.
+    print('node %d' % sid)
+    if monitor:
+        print('monitor %s' % monitor)
+    sys.exit(0)
+PY
+}
+
+# PipeWire instances worth searching for the application's audio (most likely first).
+# This box runs more than one core daemon: a seat-wide one (/run/pipewire) and a
+# per-user one (/run/user/<uid>). An application's own environment usually names
+# the right one, but an app started by a desktop/session wrapper can have a clean
+# environment, so every reachable instance is searched for its stream.
+pw_instance_candidates() {
+	local pid="$1" uid xdg pw
+	[ -n "$PW_RUNTIME" ] && printf '%s\n' "$PW_RUNTIME"
+	if pid_alive "$pid"; then
+		uid=$(awk '/^Uid:/{print $2}' "/proc/$pid/status" 2>/dev/null)
+		xdg=$(proc_env "$pid" XDG_RUNTIME_DIR || true)
+		[ -n "$xdg" ] && printf '%s\n' "$xdg"
+		pw=$(proc_env "$pid" PIPEWIRE_RUNTIME_DIR || true)
+		[ -n "$pw" ] && printf '%s\n' "$pw"
+		[ -n "$uid" ] && printf '/run/user/%s\n' "$uid"
+	fi
+	printf '/run/user/%s\n' "$(id -u)"
+	printf '%s\n' /run/pipewire
+}
+
+# Resolve what to record for audio, most-isolated first:
+#   1. --audio-source (an explicit PipeWire/Pulse source)
+#   2. the application's own output stream -> app mode: only it is captured
+#   3. the sink that stream feeds    -> sink mode: the whole device
+#   4. pactl sink-inputs             -> sink mode
+#   5. the default sink              -> sink mode
+# Sets AUDIO_KIND (app|sink), AUDIO_TARGET (node id or source name), plus
+# AUDIO_SERVER/PW_RUNTIME for the instance it was found on.
+resolve_audio_target() {
+	local pid="$1" dir server cand src info node monitor
+	local fallback_src="" fallback_dir="" fallback_server=""
+	local -a instances=()
+	while IFS= read -r dir; do instances+=("$dir"); done \
+		< <(pw_instance_candidates "$pid" | awk '!seen[$0]++')
+	AUDIO_KIND=""
+	AUDIO_TARGET=""
+
+	# 1. An explicitly requested source, searched across all instances.
+	if [ -n "$AUDIO_SOURCE" ]; then
+		for dir in "${instances[@]}"; do
+			[ -S "$dir/pulse/native" ] || continue
+			server="unix:$dir/pulse/native"
+			for cand in "$AUDIO_SOURCE" "${AUDIO_SOURCE}.monitor"; do
+				if pactl -s "$server" list short sources 2>/dev/null | awk '{print $2}' | grep -Fxq "$cand"; then
+					AUDIO_SERVER="$server"
+					PW_RUNTIME="$dir"
+					AUDIO_KIND="sink"
+					AUDIO_TARGET="$cand"
+					log "audio: $cand (requested source — device monitor, not application-only)"
+					return 0
+				fi
+			done
+		done
+		warn "audio source '$AUDIO_SOURCE' not found on any PipeWire instance"
+	fi
+
+	# 2./3. Follow the application's own stream through the PipeWire graph.
+	if pid_alive "$pid"; then
+		for dir in "${instances[@]}"; do
+			[ -S "$dir/pulse/native" ] || continue
+			server="unix:$dir/pulse/native"
+			info=$(pw_audio_info "$pid" "$dir")
+			node=$(printf '%s\n' "$info" | awk '/^node /{print $2; exit}')
+			monitor=$(printf '%s\n' "$info" | awk '/^monitor /{print $2; exit}')
+			if [ -n "$monitor" ] && [ -z "$fallback_src" ]; then
+				fallback_src="$monitor"
+				fallback_dir="$dir"
+				fallback_server="$server"
+			fi
+			[ -n "$node" ] || continue
+			if [ "$AUDIO_MODE" = "app" ]; then
+				AUDIO_SERVER="$server"
+				PW_RUNTIME="$dir"
+				AUDIO_KIND="app"
+				AUDIO_TARGET="$node"
+				log "audio: tapping this application's own stream (PipeWire node $node, instance $dir)"
+				return 0
+			fi
+			break
+		done
+	fi
+
+	# Sink monitor of the device the application plays to. Only in sink mode: in
+	# app mode the recording stays video-only until the application's own stream
+	# exists, because the device monitor would pull in every other application
+	# playing on it — the point of app mode is that it does not.
+	if [ "$AUDIO_MODE" = "sink" ] && [ -n "$fallback_src" ] && pactl -s "$fallback_server" list short sources 2>/dev/null | awk '{print $2}' | grep -Fxq "$fallback_src"; then
+		AUDIO_SERVER="$fallback_server"
+		PW_RUNTIME="$fallback_dir"
+		AUDIO_KIND="sink"
+		AUDIO_TARGET="$fallback_src"
+		log "audio: $fallback_src (device monitor — other apps on it are included)"
+		return 0
+	fi
+
+	# 4. pactl sink-inputs on the instance resolved from the application's environment.
+	if [ "$AUDIO_MODE" = "sink" ] && pid_alive "$pid"; then
+		local pids
+		pids=$(pids_of_tree "$pid" | tr '\n' '|' | sed 's/|$//')
+		while IFS= read -r src; do
+			[ -n "$src" ] || continue
+			if source_exists "$src"; then
+				AUDIO_KIND="sink"
+				AUDIO_TARGET="$src"
+				log "audio: $src (from pactl sink-inputs — device monitor)"
+				return 0
+			fi
+		done <<<"$(sink_inputs_for_pid_tree "$pids")"
+	fi
+
+	# 5. Last resort, sink mode only: the default sink of the resolved instance.
+	if [ "$AUDIO_MODE" = "sink" ]; then
+		src=$(pactl -s "$AUDIO_SERVER" get-default-sink 2>/dev/null | head -n1)
+		if [ -n "$src" ] && source_exists "${src}.monitor"; then
+			AUDIO_KIND="sink"
+			AUDIO_TARGET="${src}.monitor"
+			log "audio: ${src}.monitor (default sink of $AUDIO_SERVER)"
+			return 0
+		fi
+	fi
+
+	if [ "$AUDIO_MODE" = "app" ]; then
+		log "audio: the application has no audio stream yet — recording video only until it appears"
+	fi
+	return 1
+}
+
+# --- per-application audio tap ------------------------------------------------
+# PipeWire exposes no per-stream monitor, but a capture stream can be linked
+# directly to the application's output ports. That yields its audio only, with
+# no change to what is audible and no added latency. Verified on this box with
+# two distinguishable tones: only the tapped stream's tone was captured.
+pw_capture_node_for_pid() {
+	local pid="$1" dir="$2"
+	PIPEWIRE_RUNTIME_DIR="$dir" XDG_RUNTIME_DIR="$dir" \
+		python3 - "$pid" <(PIPEWIRE_RUNTIME_DIR="$dir" XDG_RUNTIME_DIR="$dir" pw-dump 2>/dev/null) <<'PY'
+import json, sys
+
+pid = sys.argv[1]
+try:
+    data = json.load(open(sys.argv[2]))
+except Exception:
+    sys.exit(0)
+
+clients = {c['id']: c.get('info', {}).get('props', {}) or {}
+           for c in data if c.get('type') == 'PipeWire:Interface:Client'}
+for item in data:
+    if item.get('type') != 'PipeWire:Interface:Node':
+        continue
+    props = item.get('info', {}).get('props', {}) or {}
+    if props.get('media.class') != 'Stream/Input/Audio':
+        continue
+    cid = props.get('client.id')
+    cprops = clients.get(int(cid), {}) if cid is not None else {}
+    if pid in (str(cprops.get('application.process.id')), str(props.get('application.process.id'))):
+        print(item['id'])
+        break
+PY
+}
+
+# Links feeding the tap from anything other than the application, as
+# "<out-node>:<port> <in-node>:<port>" pairs, so they can be disconnected.
+tap_stale_links() {
+	local recnode="$1" keepnode="$2"
+	PIPEWIRE_RUNTIME_DIR="$PW_RUNTIME" XDG_RUNTIME_DIR="$PW_RUNTIME" \
+		python3 - "$recnode" "$keepnode" <(PIPEWIRE_RUNTIME_DIR="$PW_RUNTIME" XDG_RUNTIME_DIR="$PW_RUNTIME" pw-dump 2>/dev/null) <<'PY'
+import json, sys
+
+rec, keep = int(sys.argv[1]), int(sys.argv[2])
+try:
+    data = json.load(open(sys.argv[3]))
+except Exception:
+    sys.exit(0)
+
+ports = {}
+for item in data:
+    if item.get('type') != 'PipeWire:Interface:Port':
+        continue
+    p = item.get('info', {}).get('props', {}) or {}
+    ports[item['id']] = (p.get('node.id'), p.get('port.name'))
+for item in data:
+    if item.get('type') != 'PipeWire:Interface:Link':
+        continue
+    p = item.get('info', {}).get('props', {}) or {}
+    if p.get('link.input.node') != rec or p.get('link.output.node') == keep:
+        continue
+    a, b = ports.get(p.get('link.output.port')), ports.get(p.get('link.input.port'))
+    if a and b and a[1] and b[1]:
+        print('%s:%s %s:%s' % (a[0], a[1], b[0], b[1]))
+PY
+}
+
+# Start a capture stream on the application's node, writing raw PCM to $1.
+tap_start() {
+	local fifo="$1" node="$2" i=0 port
+	rm -f "$fifo"
+	mkfifo "$fifo" || return 1
+	# Hold a handle open on both ends: opening a fifo for writing alone blocks
+	# until a reader appears, which would deadlock before pw-record starts.
+	# O_RDWR never blocks, and it keeps ffmpeg's read-open from blocking too.
+	exec 9<>"$fifo" || {
+		rm -f "$fifo"
+		return 1
+	}
+	PIPEWIRE_RUNTIME_DIR="$PW_RUNTIME" XDG_RUNTIME_DIR="$PW_RUNTIME" \
+		pw-record --container raw --target 0 --rate 48000 --channels 2 --format s16 "$fifo" &
+	TAPPID=$!
+	TAPNODE=""
+	while [ "$i" -lt 30 ]; do
+		TAPNODE=$(pw_capture_node_for_pid "$TAPPID" "$PW_RUNTIME")
+		[ -n "$TAPNODE" ] && break
+		kill -0 "$TAPPID" 2>/dev/null || break
+		sleep 0.1
+		i=$((i + 1))
+	done
+	exec 9>&-
+	if [ -z "$TAPNODE" ]; then
+		warn "the audio tap did not appear in the PipeWire graph"
+		tap_stop
+		rm -f "$fifo"
+		return 1
+	fi
+	for port in FL FR; do
+		pw-link "${node}:output_${port}" "${TAPNODE}:input_${port}" >/dev/null 2>&1
+	done
+	# Drop anything else feeding the tap (e.g. a session manager wiring it to a
+	# microphone), so the recording really contains only the application.
+	local a b
+	while read -r a b; do
+		[ -n "$a" ] && [ -n "$b" ] && pw-link -d "$a" "$b" >/dev/null 2>&1
+	done < <(tap_stale_links "$TAPNODE" "$node")
+	return 0
+}
+
+tap_stop() {
+	local pid="$TAPPID" i=0
+	TAPPID=""
+	TAPNODE=""
+	[ -n "$pid" ] || return 0
+	if pid_alive "$pid"; then
+		kill -TERM "$pid" 2>/dev/null
+		while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 20 ]; do
+			sleep 0.1
+			i=$((i + 1))
+		done
+		kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+		wait "$pid" 2>/dev/null
+	fi
+	return 0
+}
+
+pids_of_tree() {
+	local root="$1"
+	python3 - "$root" <<'PY'
+import os, sys
+root = int(sys.argv[1])
+pids, changed = {root}, True
+while changed:
+    changed = False
+    for d in os.listdir('/proc'):
+        if not d.isdigit():
+            continue
+        p = int(d)
+        if p in pids:
+            continue
+        try:
+            with open('/proc/%d/stat' % p) as fh:
+                st = fh.read()
+            ppid = int(st[st.rfind(')') + 2:].split()[1])
+        except Exception:
+            continue
+        if ppid in pids:
+            pids.add(p); changed = True
+for p in sorted(pids):
+    print(p)
+PY
+}
+
+# ------------------------------------------------------- encoder selection ---
+nvenc_works() {
+	ffmpeg -hide_banner -loglevel error -nostdin -f lavfi -i "color=black:s=256x256:d=0.1" \
+		-frames:v 1 -c:v h264_nvenc -f null - >/dev/null 2>&1
+}
+
+choose_encoder() {
+	case "$ENCODER" in
+	auto | "")
+		# No pipes here: with `pipefail` a `grep -q` that exits early can
+		# turn this test into a SIGPIPE failure and silently disable NVENC.
+		local encoders
+		encoders=$(ffmpeg -hide_banner -encoders 2>/dev/null || true)
+		case "$encoders" in
+		*h264_nvenc*)
+			if nvenc_works; then
+				ENCODER="h264_nvenc"
+				log "encoder: h264_nvenc (hardware)"
+			else
+				ENCODER="libx264"
+				log "encoder: libx264 (software; NVENC present but unusable)"
+			fi
+			;;
+		*)
+			ENCODER="libx264"
+			log "encoder: libx264 (software)"
+			;;
+		esac
+		;;
+	*) log "encoder: $ENCODER (requested)" ;;
+	esac
+}
+
+encoder_args() {
+	case "$ENCODER" in
+	*nvenc*)
+		printf '%s\n' -c:v "$ENCODER" -preset p5 -tune hq -rc vbr -cq "$QUALITY" -b:v 0 \
+			-maxrate 60M -bufsize 120M -pix_fmt yuv420p \
+			-g "$((FPS * 2))" -keyint_min "$FPS"
+		;;
+	libx264* | libx265*)
+		printf '%s\n' -c:v "$ENCODER" -preset veryfast -crf "$QUALITY" -pix_fmt yuv420p \
+			-g "$((FPS * 2))" -keyint_min "$FPS"
+		;;
+	*) printf '%s\n' -c:v "$ENCODER" -pix_fmt yuv420p ;;
+	esac
+}
+
+# ---------------------------------------------------------- segment control ---
+# Screen size of a display (sets SW/SH), used to clip a partly off-screen window.
+screen_size() {
+	local disp="$1" xa="${2:-}" info
+	if [ -n "$xa" ]; then
+		info=$(DISPLAY="$disp" XAUTHORITY="$xa" xwininfo -root 2>/dev/null)
+	else
+		info=$(DISPLAY="$disp" xwininfo -root 2>/dev/null)
+	fi
+	SW=$(printf '%s\n' "$info" | awk -F: '/^  Width/{gsub(/ /,"",$2); print $2}')
+	SH=$(printf '%s\n' "$info" | awk -F: '/^  Height/{gsub(/ /,"",$2); print $2}')
+	[ -n "$SW" ] && [ -n "$SH" ]
+}
+
+# Clipped capture rectangle for the target window -> CX CY CW CH.
+capture_rect() {
+	geom_of "$WIN_ID" "$WIN_DISPLAY" "$WIN_XAUTH" || return 1
+	CX="$GX"
+	CY="$GY"
+	CW="$GW"
+	CH="$GH"
+	if screen_size "$WIN_DISPLAY" "$WIN_XAUTH"; then
+		if [ "$CX" -lt 0 ]; then
+			CW=$((CW + CX))
+			CX=0
+		fi
+		if [ "$CY" -lt 0 ]; then
+			CH=$((CH + CY))
+			CY=0
+		fi
+		[ $((CX + CW)) -gt "$SW" ] && CW=$((SW - CX))
+		[ $((CY + CH)) -gt "$SH" ] && CH=$((SH - CY))
+	fi
+	[ "$CW" -ge 32 ] && [ "$CH" -ge 32 ]
+}
+
+# Windows stacked above the target that overlap CX/CY/CW/CH, as
+# "<id> <class> <x> <y> <w> <h>" lines. The target's own ancestors (its window
+# manager frame) and its own children are skipped — they are part of the target.
+# DISPLAY/XAUTHORITY come from the environment (exported after discovery).
+# Candidate windows stacked above the target, as
+# "<id> <class> <x> <y> <w> <h> <above|below>" lines.
+#
+# xwininfo -root -tree lists root children top-most first on this box (verified
+# against screenshots for both an override-redirect popup and a managed floating
+# window), so a window listed BEFORE the target is above it. Windows listed after
+# are only interesting when they are override-redirect, which is what
+# notification daemons use; those are marked "below" and re-checked by the
+# caller. The target's own frame (class i3-frame), its children, unmapped helpers
+# and slivers are filtered out here.
+obscuring_candidates() {
+	# The tree is passed as a file argument (process substitution): stdin carries
+	# the program itself, so a pipe would never reach Python.
+	python3 - "$1" "$2" "$3" "$4" "$5" <(xwininfo -root -tree 2>/dev/null) <<'PY'
+import re, sys
+
+target_id = int(sys.argv[1], 16)
+gx, gy, gw, gh = (int(v) for v in sys.argv[2:6])
+
+row_re = re.compile(r'^( *)(0x[0-9a-fA-F]+)\s+(.*?)\s+(-?\d+)x(-?\d+)\+(-?\d+)\+(-?\d+)\s+\+(-?\d+)\+(-?\d+)\s*$')
+class_re = re.compile(r'\("([^"]*)" "([^"]*)"\)')
+
+rows = []
+for line in open(sys.argv[6]):
+    m = row_re.match(line.rstrip('\n'))
+    if not m:
+        continue
+    cm = class_re.search(m.group(3))
+    w, h = int(m.group(4)), int(m.group(5))
+    rows.append({
+        'id': int(m.group(2), 16),
+        'cls': (cm.group(2) if cm else 'unknown'),
+        'x': int(m.group(8)), 'y': int(m.group(9)),
+        'w': w, 'h': h,
+    })
+
+gi = next((i for i, r in enumerate(rows) if r['id'] == target_id), None)
+if gi is None:
+    sys.exit(0)
+
+for i, r in enumerate(rows):
+    if r['id'] == target_id:
+        continue
+    if r['cls'] in ('i3-frame', 'i3-WM_Sn'):
+        continue
+    if r['w'] < 24 or r['h'] < 24:          # helper/clipboard slivers
+        continue
+    if r['x'] + r['w'] <= gx or gx + gw <= r['x']:
+        continue
+    if r['y'] + r['h'] <= gy or gy + gh <= r['y']:
+        continue
+    print('%#x %s %d %d %d %d %s' % (r['id'], r['cls'].replace(' ', '_'), r['x'], r['y'], r['w'], r['h'],
+                                     'above' if i < gi else 'below'))
+PY
+}
+
+# Non-empty description of the first window covering the target, else empty.
+overlay_conflict() {
+	local cid cclass cx cy cw ch pos info
+	while read -r cid cclass cx cy cw ch pos; do
+		[ -n "$cid" ] || continue
+		info=$(xwininfo -id "$cid" 2>/dev/null) || continue
+		printf '%s' "$info" | grep -q 'Map State: IsViewable' || continue
+		# A dock (status bar) is a strut the window manager lays out around, not
+		# something that covers the target.
+		xprop -id "$cid" _NET_WM_WINDOW_TYPE 2>/dev/null | grep -q '_NET_WM_WINDOW_TYPE_DOCK' && continue
+		if [ "$pos" = "below" ]; then
+			# Below the target: only a genuine override-redirect popup counts,
+			# in case the stacking order in the listing is not top-first here.
+			printf '%s' "$info" | grep -q 'Override Redirect State: yes' || continue
+		fi
+		printf '%s %s at %sx%s+%s+%s\n' "$cid" "$cclass" "$cw" "$ch" "$cx" "$cy"
+		return 0
+	done < <(obscuring_candidates "$1" "$2" "$3" "$4" "$5")
+	return 1
+}
+
+start_segment() {
+	local parts="$1" use_audio="$2"
+	capture_rect || {
+		warn "cannot capture window $WIN_ID (off-screen or unreadable)"
+		return 2
+	}
+	local w="$CW" h="$CH" x="$CX" y="$CY"
+	local idx=${#SEGS[@]}
+	local file audio_desc=""
+	file=$(printf '%s/seg-%03d-%sx%s.mkv' "$parts" "$idx" "$w" "$h")
+
+	local kind="" target=""
+	if [ "$use_audio" -eq 1 ] && [ -n "$AUDIO_TARGET" ]; then
+		kind="$AUDIO_KIND"
+		target="$AUDIO_TARGET"
+	fi
+
+	local -a args=(
+		-hide_banner -nostdin -loglevel warning
+		-thread_queue_size 1024
+		-f x11grab -draw_mouse "$DRAW_MOUSE" -framerate "$FPS"
+		-video_size "${w}x${h}" -i "${WIN_DISPLAY}+${x},${y}"
+	)
+	if [ "$kind" = "app" ]; then
+		# Tap the application's own stream: raw PCM through a fifo, so one ffmpeg still
+		# handles video and audio and the two stay in step.
+		TAPFIFO=$(printf '%s/audio-%03d.fifo' "$parts" "$idx")
+		if tap_start "$TAPFIFO" "$target"; then
+			args+=(-thread_queue_size 1024 -f s16le -ar 48000 -ac 2 -i "$TAPFIFO")
+			audio_desc="application stream (node $target)"
+		else
+			tap_stop
+			rm -f "$TAPFIFO"
+			TAPFIFO=""
+			warn "per-application audio tap failed"
+			return 1
+		fi
+	elif [ "$kind" = "sink" ]; then
+		args+=(-thread_queue_size 1024 -f pulse -i "$target")
+		audio_desc="device monitor $target"
+	fi
+	args+=(-filter:v "pad=ceil(iw/2)*2:ceil(ih/2)*2")
+	while IFS= read -r a; do args+=("$a"); done < <(encoder_args)
+	if [ -n "$kind" ]; then
+		args+=(-c:a aac -b:a 192k -ar 48000 -ac 2 -af "aresample=async=1:first_pts=0")
+	else
+		args+=(-an)
+	fi
+	args+=(-flush_packets 1)
+	args+=(-f matroska "$file")
+
+	# ffmpeg runs in its own session: a terminal Ctrl-C (or a group signal from
+	# a wrapper) then hits only this script, and ffmpeg is stopped exactly once
+	# by stop_segment. Two signals in a row make ffmpeg exit immediately and
+	# lose the Matroska trailer, truncating the recording.
+	local -a runner=()
+	command -v setsid >/dev/null 2>&1 && runner=(setsid)
+	if [ -n "$PW_RUNTIME" ]; then
+		PULSE_SERVER="$AUDIO_SERVER" PIPEWIRE_RUNTIME_DIR="$PW_RUNTIME" "${runner[@]}" ffmpeg "${args[@]}" &
+	else
+		PULSE_SERVER="$AUDIO_SERVER" "${runner[@]}" ffmpeg "${args[@]}" &
+	fi
+	FFPID=$!
+	sleep 1
+	if ! kill -0 "$FFPID" 2>/dev/null; then
+		warn "ffmpeg exited immediately (segment $idx)"
+		wait "$FFPID" 2>/dev/null
+		FFPID=""
+		return 1
+	fi
+	SEG_ACTIVE=1
+	SEGS+=("$file")
+	SEG_SIZES+=("${w}x${h}")
+	log "recording ${w}x${h}+${x}+${y} on ${WIN_DISPLAY} -> $(basename "$file")${audio_desc:+  [audio: ${audio_desc}]}"
+	return 0
+}
+
+stop_segment() {
+	[ "$SEG_ACTIVE" -eq 1 ] || return 0
+	local pid="$FFPID" waited=0 first
+	# Stop the audio tap first: while it is running ffmpeg is reading a live
+	# fifo, and if the recording target just went away that read can block with
+	# no data, so ffmpeg would not notice the stop signal until it was killed and
+	# the tail of the segment was lost. With the tap gone the fifo reports EOF
+	# and ffmpeg reacts immediately.
+	tap_stop
+	[ -n "$TAPFIFO" ] && rm -f "$TAPFIFO"
+	TAPFIFO=""
+	if pid_alive "$pid"; then
+		# One graceful signal is enough for ffmpeg to write the Matroska trailer
+		# and close the file cleanly. A second signal in a row would make it
+		# exit immediately and lose the trailer, so never send two at once.
+		first=$(stop_signal_for "$pid")
+		if [ -z "$first" ]; then
+			warn "ffmpeg ignores SIGINT and SIGTERM — killing it"
+			kill -KILL "$pid" 2>/dev/null
+		else
+			kill -"$first" "$pid" 2>/dev/null
+		fi
+		while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 40 ]; do
+			sleep 0.25
+			waited=$((waited + 1))
+		done
+		if kill -0 "$pid" 2>/dev/null; then
+			warn "ffmpeg did not stop after SIG$first — escalating"
+			kill -TERM "$pid" 2>/dev/null
+			waited=0
+			while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 20 ]; do
+				sleep 0.25
+				waited=$((waited + 1))
+			done
+		fi
+		if kill -0 "$pid" 2>/dev/null; then
+			warn "ffmpeg had to be killed — the last seconds of this segment may be lost"
+			kill -KILL "$pid" 2>/dev/null
+		fi
+		wait "$pid" 2>/dev/null
+	fi
+	FFPID=""
+	SEG_ACTIVE=0
+}
+
+# ------------------------------------------------------------- finalisation ---
+remux_single() {
+	local src="$1" dst="$2"
+	ffmpeg -hide_banner -nostdin -loglevel error -y -i "$src" -c copy -movflags +faststart "$dst"
+}
+
+concat_segments() {
+	local dst="$1" parts="$2"
+	local -a all=("${SEGS[@]}")
+	local same=1 i
+	for i in "${!SEG_SIZES[@]}"; do
+		[ "${SEG_SIZES[$i]}" = "${SEG_SIZES[0]}" ] || same=0
+	done
+	local list="$parts/concat.txt"
+	: >"$list"
+	for i in "${all[@]}"; do
+		printf "file '%s'\n" "$i" >>"$list"
+	done
+	if [ "$same" -eq 1 ]; then
+		if ffmpeg -hide_banner -nostdin -loglevel error -y -f concat -safe 0 -i "$list" \
+			-c copy -movflags +faststart "$dst" && probe_ok "$dst"; then
+			return 0
+		fi
+		warn "stream-copy concat failed, re-encoding instead"
+	fi
+	local w="${SEG_SIZES[0]%x*}" h="${SEG_SIZES[0]#*x}"
+	local -a vargs vfilter
+	while IFS= read -r a; do vargs+=("$a"); done < <(encoder_args)
+	vfilter=(-vf "scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2")
+	ffmpeg -hide_banner -nostdin -loglevel error -y -f concat -safe 0 -i "$list" \
+		"${vfilter[@]}" "${vargs[@]}" -c:a aac -b:a 192k -ar 48000 -ac 2 -movflags +faststart "$dst"
+}
+
+probe_ok() {
+	local f="$1" dur
+	[ -s "$f" ] || return 1
+	dur=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$f" 2>/dev/null)
+	[ -n "$dur" ] || return 1
+	awk -v d="$dur" 'BEGIN{exit !(d > 0.3)}'
+}
+
+finalize() {
+	[ "$FINALIZED" -eq 1 ] && return 0
+	FINALIZED=1
+	[ "$SEG_ACTIVE" -eq 1 ] && stop_segment
+
+	local n=${#SEGS[@]}
+	[ "$n" -gt 0 ] || {
+		warn "no recording was produced"
+		notify "Minecraft recording failed" "No video was captured" "dialog-error"
+		return 1
+	}
+
+	local parts="${OUT%.*}.parts"
+	local ok=0
+	if [ "$n" -eq 1 ]; then
+		if remux_single "${SEGS[0]}" "$OUT" && probe_ok "$OUT"; then ok=1; fi
+	else
+		log "joining $n segments"
+		if concat_segments "$OUT" "$parts" && probe_ok "$OUT"; then ok=1; fi
+	fi
+
+	if [ "$ok" -ne 1 ]; then
+		warn "could not build $OUT — keeping the raw segments in $parts"
+		notify "Minecraft recording failed" "Could not write $(basename "$OUT"); segments kept in $parts" "dialog-error"
+		return 1
+	fi
+
+	local size dur res streams
+	size=$(du -h "$OUT" | cut -f1)
+	dur=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$OUT" 2>/dev/null)
+	res=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x "$OUT" 2>/dev/null)
+	streams=$(ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$OUT" 2>/dev/null | paste -sd, -)
+	log "saved $OUT"
+	log "  duration: $(printf '%.1f' "${dur:-0}")s   size: $size   video: ${res:-?}   streams: ${streams:-?}"
+	ln -sfn "$(basename "$OUT")" "$(dirname "$OUT")/latest.mp4" 2>/dev/null || true
+	notify "Minecraft recording saved" "$(basename "$OUT") — $(printf '%.0f' "${dur:-0}")s, $size" "media-record"
+	if [ "$KEEP_PARTS" -eq 0 ]; then rm -rf "$parts"; else log "  raw segments kept in $parts"; fi
+	return 0
+}
+
+on_signal() {
+	STOP=1
+}
+cleanup() {
+	stop_segment >/dev/null 2>&1
+	# If we leave through an error path (die, signal), still turn whatever was
+	# captured into the finished file instead of abandoning it in .parts.
+	if [ "$FINALIZED" -eq 0 ] && [ -n "$OUT" ] && [ "${#SEGS[@]}" -gt 0 ]; then
+		warn "stopping early — saving what was recorded"
+		finalize >/dev/null 2>&1 || warn "could not build $OUT; raw segments are in ${OUT%.*}.parts"
+	fi
+	release_pidfile
+}
+trap on_signal INT TERM HUP
+trap cleanup EXIT
+
+# -------------------------------------------------------------------- main ---
+log "app-recorder $VERSION"
+
+# Hotkey / control mode: --toggle starts a detached recording or stops the one
+# that is running; --stop only stops.
+if [ "$TOGGLE" -eq 1 ] || [ "$STOP_MODE" -eq 1 ]; then
+	if p=$(running_pid); then
+		# Use a signal the recording actually listens to. A recording started
+		# from a shell/hotkey context can have SIGINT ignored, in which case
+		# SIGINT would leave it running forever.
+		sig=$(stop_signal_for "$p")
+		[ -n "$sig" ] || sig=TERM
+		kill -"$sig" "$p" 2>/dev/null
+		log "stopping the running recording (pid $p, SIG$sig)"
+		sleep 1
+		if pid_alive "$p"; then
+			if [ "$sig" = "TERM" ]; then
+				alt="INT"
+				altnum=2
+			else
+				alt="TERM"
+				altnum=15
+			fi
+			if ! signal_ignored "$p" "$altnum"; then
+				log "still running — also sending SIG$alt"
+				kill -"$alt" "$p" 2>/dev/null
+			fi
+		fi
+		notify "Minecraft recording" "Stopping…" "media-playback-stop" 1200
+		exit 0
+	fi
+	if [ "$STOP_MODE" -eq 1 ]; then
+		log "no recording is running"
+		notify "Minecraft recording" "Nothing is being recorded" "dialog-information"
+		exit 0
+	fi
+
+	declare -a start_args=(--notify)
+	[ -n "$OUT" ] && start_args+=(-o "$OUT")
+	[ "$FPS_GIVEN" -eq 1 ] && start_args+=(--fps "$FPS")
+	[ "$QUALITY" != "23" ] && start_args+=(--quality "$QUALITY")
+	[ "$AUDIO" -eq 0 ] && start_args+=(--no-audio)
+	[ -n "$AUDIO_SOURCE" ] && start_args+=(--audio-source "$AUDIO_SOURCE")
+	[ "$AUDIO_MODE" != "app" ] && start_args+=(--audio-mode "$AUDIO_MODE")
+	[ "$ALLOW_OVERLAP" -eq 1 ] && start_args+=(--allow-overlap)
+	[ "$WINDOW_PATTERN" != "minecraft" ] && start_args+=(--window-name "$WINDOW_PATTERN")
+	[ "$PAUSE_HIDDEN" -eq 0 ] && start_args+=(--no-pause)
+	[ "$DRAW_MOUSE" -eq 0 ] && start_args+=(--no-mouse)
+	[ "$KEEP_PARTS" -eq 1 ] && start_args+=(--keep-parts)
+	[ -n "$FORCED_DISPLAY" ] && start_args+=(--display "$FORCED_DISPLAY")
+	[ -n "$FORCED_PID" ] && start_args+=(--pid "$FORCED_PID")
+	[ "$ENCODER" != "auto" ] && start_args+=(--encoder "$ENCODER")
+	if [ -n "${MC_RECORD_OPTS:-}" ]; then
+		read -r -a extra_opts <<<"$MC_RECORD_OPTS"
+		start_args+=("${extra_opts[@]}")
+	fi
+
+	: >>"$LOGFILE" 2>/dev/null || LOGFILE=/dev/null
+	if command -v setsid >/dev/null 2>&1; then
+		APP_RECORDER_DETACHED=1 setsid nohup "$0" "${start_args[@]}" >>"$LOGFILE" 2>&1 &
+	else
+		APP_RECORDER_DETACHED=1 nohup "$0" "${start_args[@]}" >>"$LOGFILE" 2>&1 &
+	fi
+	log "started a detached recording (log: $LOGFILE)"
+	# Give it a moment, then tell the user whether it actually came up.
+	sleep 2
+	if p=$(running_pid); then
+		notify "Minecraft recording" "Recording started — press Ctrl+Mod+R again to stop" "media-record"
+	else
+		log "the detached recording did not start; see $LOGFILE"
+		notify "Minecraft recording" "Could not start recording — see $LOGFILE" "dialog-error"
+		exit 1
+	fi
+	exit 0
+fi
+
+if [ "$AUDIO" -eq 0 ]; then log "audio: disabled"; fi
+
+# Claim the pidfile immediately, even while waiting for a window to appear, so
+# that the same hotkey can cancel a waiting run instead of quietly starting a
+# second one. It is released in cleanup().
+if [ "$LIST_ONLY" -eq 0 ]; then
+	printf '%s\n' "$$" >"$PIDFILE" 2>/dev/null || warn "cannot write $PIDFILE (hotkey stop may not find this run)"
+fi
+
+# 1. Find the target window: the focused one, or the pinned pattern (wait if needed).
+deadline=$(($(date +%s) + WAIT_SECONDS))
+announced=0
+while :; do
+	if find_window; then break; fi
+	if [ "$LIST_ONLY" -eq 1 ]; then
+		if [ -n "$WINDOW_PATTERN" ]; then
+			log "no window matching '$WINDOW_PATTERN' found"
+		else
+			log "no focused window found on any display"
+		fi
+		exit 1
+	fi
+	if [ "$STOP" -eq 1 ]; then
+		log "cancelled while waiting for a window"
+		exit 0
+	fi
+	if [ "$(date +%s)" -ge "$deadline" ]; then
+		notify "Window recording" "No window to record — nothing started" "dialog-error"
+		if [ -n "$WINDOW_PATTERN" ]; then
+			die "no window matching WM_CLASS '$WINDOW_PATTERN' found within ${WAIT_SECONDS}s"
+		fi
+		die "no focused window found within ${WAIT_SECONDS}s"
+	fi
+	if [ "$announced" -eq 0 ]; then
+		if [ -n "$WINDOW_PATTERN" ]; then
+			log "waiting up to ${WAIT_SECONDS}s for a window whose WM_CLASS matches '$WINDOW_PATTERN' ..."
+			notify "Window recording" "Waiting for a matching window…" "dialog-information"
+		else
+			log "waiting up to ${WAIT_SECONDS}s for a focused window (focus something you want recorded) ..."
+			notify "Window recording" "Waiting for a window to record…" "dialog-information"
+		fi
+		announced=1
+	fi
+	sleep 2
+done
+
+[ -n "$FORCED_PID" ] && WIN_PID="$FORCED_PID"
+# Make the discovered session available to everything launched from here on
+# (ffmpeg, notify-send, focus lookups), even when started without DISPLAY set.
+export DISPLAY="$WIN_DISPLAY"
+[ -n "$WIN_XAUTH" ] && export XAUTHORITY="$WIN_XAUTH"
+log "target $WIN_ID  '${WIN_TITLE:-}'  class=${WIN_CLASS:-unknown}"
+log "display $WIN_DISPLAY  xauth ${WIN_XAUTH:-(none)}  pid ${WIN_PID:-unknown}"
+geom_of "$WIN_ID" "$WIN_DISPLAY" "$WIN_XAUTH" && log "geometry ${GW}x${GH}+${GX}+${GY}  map state $GMAP"
+if [ "$FOLLOW" -eq 1 ] && [ -z "$WINDOW_PATTERN" ]; then
+	log "following focus: the target moves if you switch application"
+else
+	[ -z "$WINDOW_PATTERN" ] && log "not following focus: staying on this window"
+fi
+
+# 2. Work out what to record for audio.
+if [ "$AUDIO" -eq 1 ]; then
+	if ! resolve_audio_server "$WIN_PID"; then
+		warn "could not determine the application's audio server — continuing without audio"
+	else
+		log "audio server: $AUDIO_SERVER${PW_RUNTIME:+  (pipewire runtime $PW_RUNTIME)}"
+		# app mode already explained itself in resolve_audio_target
+		resolve_audio_target "$WIN_PID" || { [ "$AUDIO_MODE" = "sink" ] && warn "no audio source found — continuing without audio"; }
+	fi
+fi
+
+if [ "$LIST_ONLY" -eq 1 ]; then
+	printf 'would record: window %s on %s (%s)\n' "$WIN_ID" "$WIN_DISPLAY" "$WIN_TITLE"
+	if [ "$AUDIO" -eq 0 ]; then
+		printf 'audio: <disabled>\n'
+	elif [ -n "$AUDIO_TARGET" ]; then
+		printf 'audio: %s mode -> %s (server %s)\n' "$AUDIO_KIND" "$AUDIO_TARGET" "${AUDIO_SERVER:-?}"
+	else
+		printf 'audio: <none found>\n'
+	fi
+	exit 0
+fi
+
+# 3. Output location.
+if [ -z "$OUT" ]; then
+	OUT="${HOME:-/tmp}/Videos/recordings/Recording-$(date +%Y%m%d-%H%M%S).mp4"
+fi
+case "$OUT" in
+*.mp4) ;;
+*) die "output file must end in .mp4 (got '$OUT')" ;;
+esac
+mkdir -p "$(dirname "$OUT")" || die "cannot create $(dirname "$OUT")"
+OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"
+parts="${OUT%.*}.parts"
+rm -rf "$parts"
+mkdir -p "$parts" || die "cannot create $parts"
+
+if [ "$FPS_GIVEN" -eq 0 ]; then
+	# Default to 60fps when the window is large — keeps motion smooth.
+	geom_of "$WIN_ID" "$WIN_DISPLAY" "$WIN_XAUTH" && [ "$((GW * GH))" -gt 1500000 ] && FPS=60
+fi
+choose_encoder
+log "recording to $OUT (${FPS} fps, Ctrl-C to stop)"
+
+# In pinned mode the recording ends with the pinned window; with focus following
+# it moves on to whatever is focused instead.
+pid_watch=0
+if [ -n "$FORCED_PID" ]; then
+	pid_watch=1
+elif [ -n "$WINDOW_PATTERN" ] && [ -n "$WIN_PID" ] && [ "$WIN_PID" -gt 1 ] 2>/dev/null; then
+	pid_watch=1
+fi
+
+if [ "${APP_RECORDER_DETACHED:-0}" = "1" ]; then
+	# The hotkey already told the user; a second popup would only delay capture,
+	# which waits for the screen to clear.
+	:
+else
+	notify "Window recording" "Recording ${WIN_TITLE:-window} — press Ctrl+Mod+R to stop" "media-record"
+fi
+
+# 4. Record while the target window is visible and nothing covers it. Anything
+# else on screen — a notification popup, another application's window — pauses
+# capture instead of ending up in the video. Switching application retargets.
+started_at=$(date +%s)
+cur_geom=""
+last_note=0
+fail_count=0
+tick=0
+paused_why=""
+unfocused_since=0
+while [ "$STOP" -eq 0 ]; do
+	following=0
+	[ "$FOLLOW" -eq 1 ] && [ -z "$WINDOW_PATTERN" ] && [ -z "$FORCED_PID" ] && following=1
+
+	# Another application was focused: move the recording to it.
+	if [ "$following" -eq 1 ]; then
+		wid_now=$(active_window_id)
+		if [ -n "$wid_now" ] && [ "$wid_now" != "$WIN_ID" ] && window_ok "$wid_now"; then
+			switch_target "$wid_now" || warn "could not switch to $wid_now"
+			unfocused_since=0
+			tick=$((tick + 1))
+			sleep "$POLL"
+			continue
+		fi
+	fi
+
+	if ! window_exists "$WIN_ID"; then
+		if [ "$following" -eq 1 ]; then
+			wid_now=$(active_window_id)
+			if [ -n "$wid_now" ] && window_ok "$wid_now"; then
+				log "the recorded window closed — continuing with the focused window"
+				switch_target "$wid_now" || warn "could not switch to $wid_now"
+				tick=$((tick + 1))
+				sleep "$POLL"
+				continue
+			fi
+			# Nothing to record: wait a while for the desktop to have a window
+			# again rather than saving a recording that was cut short.
+			if [ "$unfocused_since" -eq 0 ]; then
+				unfocused_since=$(date +%s)
+				log "no focused window — waiting for one (or press Ctrl+Mod+R to stop)"
+				paused_why=""
+				stop_segment
+			elif [ "$(($(date +%s) - unfocused_since))" -ge 60 ]; then
+				log "no focused window for 60s — stopping"
+				break
+			fi
+			tick=$((tick + 1))
+			sleep "$POLL"
+			continue
+		fi
+		log "window $WIN_ID is gone — stopping"
+		break
+	fi
+	if [ "$pid_watch" -eq 1 ] && ! pid_alive "$WIN_PID"; then
+		log "the recorded process ($WIN_PID) exited — stopping"
+		break
+	fi
+
+	pause_why=""
+	pause_tell=""
+	if ! capture_rect; then
+		pause_why="the window cannot be read or is off-screen"
+	elif [ "$PAUSE_HIDDEN" -eq 1 ] && [ "$GMAP" != "IsViewable" ]; then
+		pause_why="the window is not visible ($GMAP)"
+	elif [ "$ALLOW_OVERLAP" -eq 0 ]; then
+		conflict=$(overlay_conflict "$WIN_ID" "$CX" "$CY" "$CW" "$CH")
+		if [ -n "$conflict" ]; then
+			pause_why="something covers the window: $conflict"
+			pause_tell="$pause_why"
+		fi
+	fi
+
+	if [ -n "$pause_why" ]; then
+		if [ "$SEG_ACTIVE" -eq 1 ]; then
+			log "pausing — $pause_why"
+			stop_segment
+			paused_why="$pause_why"
+			[ -n "$pause_tell" ] && notify "Window recording" "Capture paused — $pause_tell" "media-playback-pause" 2000
+		elif [ "$paused_why" != "$pause_why" ]; then
+			log "waiting — $pause_why"
+			paused_why="$pause_why"
+			# Capture is already held, so this popup cannot reach the video.
+			[ -n "$pause_tell" ] && notify "Window recording" "Waiting — $pause_tell" "dialog-information" 2500
+		fi
+	else
+		if [ -n "$paused_why" ]; then
+			log "clear again — resuming"
+			paused_why=""
+		fi
+		new_geom="${CW}x${CH}+${CX}+${CY}"
+
+		# The application's audio stream node is tied to its own audio device:
+		# if it changed underneath us (or the tap died), re-tap by restarting
+		# the segment, otherwise the audio track would silently go dead.
+		if [ "$SEG_ACTIVE" -eq 1 ] && [ "$AUDIO" -eq 1 ] && [ "$AUDIO_KIND" = "app" ]; then
+			if ! pid_alive "$TAPPID"; then
+				log "the audio tap stopped — restarting the segment"
+				stop_segment
+			elif [ "$((tick % 5))" -eq 0 ]; then
+				node_now=$(pw_audio_info "$WIN_PID" "$PW_RUNTIME" 2>/dev/null | awk '/^node /{print $2; exit}')
+				if [ "$node_now" != "$AUDIO_TARGET" ]; then
+					log "the application's audio stream changed (${AUDIO_TARGET:-none} -> ${node_now:-none}) — restarting the segment"
+					stop_segment
+				fi
+			fi
+		fi
+
+		# An application that has not played a sound yet has no stream to tap. Keep
+		# watching for it so the recording switches to the per-application tap as soon
+		# as it exists, instead of sitting on the device monitor for its whole
+		# length.
+		if [ "$AUDIO" -eq 1 ] && [ "$AUDIO_MODE" = "app" ] && [ "$AUDIO_KIND" != "app" ] && [ "$((tick % 10))" -eq 0 ]; then
+			if resolve_audio_target "$WIN_PID" && [ "$AUDIO_KIND" = "app" ]; then
+				log "the application's audio stream appeared — switching to the per-application tap"
+				stop_segment
+			fi
+		fi
+
+		if [ "$SEG_ACTIVE" -eq 0 ]; then
+			cur_geom="$new_geom"
+			start_segment "$parts" "$AUDIO"
+			rc=$?
+			if [ "$rc" -eq 0 ]; then
+				fail_count=0
+			elif [ "$rc" -eq 2 ]; then
+				: # window momentarily uncapturable; try again on the next poll
+			else
+				fail_count=$((fail_count + 1))
+				if [ "$AUDIO" -eq 1 ] && [ "$AUDIO_KIND" = "app" ]; then
+					# Distinguish "the tap is broken" from "the application has no audio
+					# stream right now": only the first deserves a permanent
+					# downgrade to the device monitor.
+					node_now=""
+					[ -n "$WIN_PID" ] && node_now=$(pw_audio_info "$WIN_PID" "$PW_RUNTIME" 2>/dev/null | awk '/^node /{print $2; exit}')
+					if [ -n "$node_now" ]; then
+						warn "the per-application audio tap is not usable — falling back to the device monitor"
+						AUDIO_MODE="sink"
+					else
+						log "the application has no audio stream right now — using the device monitor until it appears"
+					fi
+					resolve_audio_target "$WIN_PID" || {
+						AUDIO=0
+						AUDIO_TARGET=""
+						warn "no audio source — continuing without audio"
+					}
+				elif [ "$AUDIO" -eq 1 ] && [ -n "$AUDIO_TARGET" ] && [ "$fail_count" -ge 2 ]; then
+					warn "video+audio still failing — continuing without audio"
+					AUDIO=0
+					AUDIO_TARGET=""
+				fi
+				if [ "$fail_count" -ge 15 ]; then
+					die "ffmpeg could not start after $fail_count attempts"
+				fi
+			fi
+		elif [ "$new_geom" != "$cur_geom" ]; then
+			log "window geometry changed ($cur_geom -> $new_geom) — starting a new segment"
+			stop_segment
+			cur_geom="$new_geom"
+			start_segment "$parts" "$AUDIO" || warn "could not restart recording"
+		elif ! pid_alive "$FFPID"; then
+			warn "ffmpeg stopped unexpectedly — restarting the segment"
+			SEG_ACTIVE=0
+			start_segment "$parts" "$AUDIO" || warn "could not restart recording"
+		fi
+	fi
+
+	tick=$((tick + 1))
+	now=$(date +%s)
+	if [ "$((now - last_note))" -ge 60 ]; then
+		log "still recording ($((now - started_at))s, ${#SEGS[@]} segment(s))"
+		last_note=$now
+	fi
+	sleep "$POLL"
+done
+
+stop_segment
+finalize
+rc=$?
+[ "$rc" -eq 0 ] || die "recording finished with errors"
+log "done."

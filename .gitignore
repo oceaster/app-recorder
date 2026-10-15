@@ -1,0 +1,12 @@
+*.swp
+*.swo
+*~
+.DS_Store
+/dist/
+
+# recordings produced by running the tool from the checkout
+*.mp4
+*.mkv
+*.parts/
+*.fifo
+tests/tmp/

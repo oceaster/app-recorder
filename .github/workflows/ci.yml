@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: ShellCheck
+        run: shellcheck app-recorder tests/run-tests.sh
+      - name: Check formatting (shfmt)
+        run: |
+          go install mvdan.cc/sh/v3/cmd/shfmt@latest
+          shfmt -d app-recorder
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Xvfb, a window manager and a small X application let the suite record for
+      # real on a throwaway display instead of only checking the CLI contract.
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg xvfb i3-wm x11-apps x11-utils wmctrl xdotool
+      - name: Test suite
+        run: ./tests/run-tests.sh
